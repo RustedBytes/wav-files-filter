@@ -1,10 +1,10 @@
-// src/main.rs
-
 use anyhow::{Context, Result};
 use clap::Parser;
 use hound::WavReader;
+use rayon::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use walkdir::WalkDir;
 
 /// CLI application to filter WAV audio files by duration.
@@ -58,53 +58,52 @@ fn main() -> Result<()> {
         )
     })?;
 
-    let mut copied_count = 0u64;
+    let copied_count = AtomicU64::new(0);
 
-    // Walk the input directory recursively
-    for entry in WalkDir::new(&args.input).follow_links(false).into_iter() {
-        let entry = entry.with_context(|| "Failed to read directory entry")?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
+    // Walk the input directory and process files in parallel
+    WalkDir::new(&args.input)
+        .follow_links(false)
+        .into_iter()
+        .par_bridge() // Convert the iterator to a parallel one
+        .filter_map(|entry| entry.ok()) // Filter out directory reading errors
+        .filter(|entry| entry.file_type().is_file())
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("wav"))
+        .try_for_each(|entry| -> Result<()> {
+            let path = entry.path();
+            let duration = get_duration_ms(path)?;
+            if duration >= args.min_length && duration <= args.max_length {
+                // Compute relative path and target output path
+                let rel_path = path.strip_prefix(&args.input).with_context(|| {
+                    format!("Failed to compute relative path for: {}", path.display())
+                })?;
+                let out_path = args.output.join(rel_path);
 
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("wav") {
-            continue;
-        }
+                // Ensure parent directories exist
+                if let Some(parent) = out_path.parent() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!(
+                            "Failed to create parent directory for: {}",
+                            out_path.display()
+                        )
+                    })?;
+                }
 
-        let duration = get_duration_ms(path)?;
-        if duration >= args.min_length && duration <= args.max_length {
-            // Compute relative path and target output path
-            let rel_path = path.strip_prefix(&args.input).with_context(|| {
-                format!("Failed to compute relative path for: {}", path.display())
-            })?;
-            let out_path = args.output.join(rel_path);
-
-            // Ensure parent directories exist
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent).with_context(|| {
+                // Copy the file
+                fs::copy(path, &out_path).with_context(|| {
                     format!(
-                        "Failed to create parent directory for: {}",
+                        "Failed to copy {} to {}",
+                        path.display(),
                         out_path.display()
                     )
                 })?;
+                copied_count.fetch_add(1, Ordering::Relaxed);
             }
-
-            // Copy the file
-            fs::copy(path, &out_path).with_context(|| {
-                format!(
-                    "Failed to copy {} to {}",
-                    path.display(),
-                    out_path.display()
-                )
-            })?;
-            copied_count += 1;
-        }
-    }
+            Ok(())
+        })?;
 
     println!(
         "Filtered and copied {} WAV files to {}",
-        copied_count,
+        copied_count.load(Ordering::Relaxed),
         args.output.display()
     );
     Ok(())
