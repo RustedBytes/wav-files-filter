@@ -12,7 +12,7 @@ A simple, efficient command-line tool for recursively filtering WAV audio files 
 
 ## Installation
 
-### From Crates.io (Recommended)
+### From Repository
 
 ```bash
 cargo install --git https://github.com/RustedBytes/wav-files-filter
